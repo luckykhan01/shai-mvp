@@ -5,3 +5,4 @@ services/parser/.idea
 services/parser/app/.idea
 services/parser/app/.venv
 .DS_Store
+.idea/
