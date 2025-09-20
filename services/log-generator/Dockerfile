@@ -1,5 +1,15 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
+
 WORKDIR /app
-RUN pip install requests
-COPY generator.py /app/generator.py
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY generator.py .
+
+# Environment defaults can be overridden by compose/.env
+ENV PARSER_URL="http://parser:8000/ingest"
+ENV RATE="5"
+ENV BATCH="5"
+
 CMD ["python", "generator.py"]

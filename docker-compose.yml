@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+  parser:
+    build:
+      context: ./services/parser
+      dockerfile: Dockerfile
+    container_name: parser
+    ports:
+      - "8001:8000"              # host:container
+    environment:
+      - UVICORN_HOST=0.0.0.0
+      - UVICORN_PORT=8000
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  ml-detector:
+    build:
+      context: ./services/ml-detector
+      dockerfile: Dockerfile
+    container_name: ml-detector
+    ports:
+      - "8002:8000"              # host:container
+    environment:
+      - UVICORN_HOST=0.0.0.0
+      - UVICORN_PORT=8000
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  log-generator:
+    build:
+      context: ./services/log-generator
+      dockerfile: Dockerfile
+    container_name: log-generator
+    environment:
+      - PARSER_URL=${PARSER_URL-http://parser:8000/ingest}
+      - RATE=${RATE-5}           # events/sec
+      - BATCH=${BATCH-5}         # events per POST
+    depends_on:
+      parser:
+        condition: service_healthy
+    restart: unless-stopped
