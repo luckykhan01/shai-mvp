@@ -1,0 +1,7 @@
+.venv
+services/ml-detector/app/.idea
+services/ml-detector/app/.venv
+services/parser/.idea
+services/parser/app/.idea
+services/parser/app/.venv
+.DS_Store
