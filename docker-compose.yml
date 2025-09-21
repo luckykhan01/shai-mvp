@@ -135,6 +135,17 @@ services:
       - shai-network
     restart: unless-stopped
 
+  frontend:
+    build: ./frontend
+    container_name: shai-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    networks:
+      - shai-network
+    restart: unless-stopped
+
 networks:
   shai-network:
     driver: bridge
