@@ -1,0 +1,101 @@
+### Test anomalies endpoint
+GET http://localhost:8001/anomalies?limit=20
+Content-Type: application/json
+
+### Test anomalies endpoint with default limit
+GET http://localhost:8001/anomalies
+Content-Type: application/json
+
+### Test anomalies endpoint with custom limit
+GET http://localhost:8001/anomalies?limit=5
+Content-Type: application/json
+
+### Test anomalies by IP endpoint
+GET http://localhost:8001/anomalies/192.168.1.100
+Content-Type: application/json
+
+### Test anomalies by IP with custom limit
+GET http://localhost:8001/anomalies/10.0.0.50?limit=10
+Content-Type: application/json
+
+### Test features (events/logs) by IP endpoint
+GET http://localhost:8001/features/192.168.1.100
+Content-Type: application/json
+
+### Test features by IP with custom limit
+GET http://localhost:8001/features/10.0.0.50?limit=20
+Content-Type: application/json
+
+### Test IPs list endpoint
+GET http://localhost:8001/ips
+Content-Type: application/json
+
+### Test IPs list with custom limit
+GET http://localhost:8001/ips?limit=50
+Content-Type: application/json
+
+### Test Allow List endpoints
+GET http://localhost:8001/lists/allow
+Content-Type: application/json
+
+POST http://localhost:8001/lists/allow
+Content-Type: application/json
+
+{
+  "type": "ip",
+  "value": "192.168.1.100",
+  "description": "Trusted internal IP",
+  "expires_at": null
+}
+
+DELETE http://localhost:8001/lists/allow
+Content-Type: application/json
+
+{
+  "item_id": 1
+}
+
+### Test Deny List endpoints
+GET http://localhost:8001/lists/deny
+Content-Type: application/json
+
+POST http://localhost:8001/lists/deny
+Content-Type: application/json
+
+{
+  "type": "ip",
+  "value": "10.0.0.50",
+  "description": "Blocked malicious IP",
+  "expires_at": null
+}
+
+DELETE http://localhost:8001/lists/deny
+Content-Type: application/json
+
+{
+  "item_type": "ip",
+  "value": "10.0.0.50"
+}
+
+### Test Suppress endpoint
+POST http://localhost:8001/suppress
+Content-Type: application/json
+
+{
+  "type": "ip",
+  "value": "192.168.1.200",
+  "minutes": 30,
+  "description": "Temporary suppression for maintenance"
+}
+
+### Test Export NDJSON endpoint
+GET http://localhost:8001/export/actions.ndjson
+Accept: application/x-ndjson
+
+### Test Export with time range
+GET http://localhost:8001/export/actions.ndjson?since=2024-01-01T00:00:00Z&until=2024-12-31T23:59:59Z&limit=1000
+Accept: application/x-ndjson
+
+### Test Export with limit
+GET http://localhost:8001/export/actions.ndjson?limit=100
+Accept: application/x-ndjson

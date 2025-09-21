@@ -1,28 +1,22 @@
 from __future__ import annotations
 
-import os, json, gzip, logging, datetime as dt, statistics as stats
+import os, json, logging, datetime as dt, statistics as stats
 from typing import Any, Dict, List, Tuple, Deque, Optional
 from collections import deque, defaultdict
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 
-from fastapi import FastAPI, HTTPException, Body, Request
-from pydantic import BaseModel, conlist
-from starlette.responses import JSONResponse
-
-import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.feature_extraction import DictVectorizer
 from sklearn.exceptions import NotFittedError
 import joblib
 
-import psycopg2
 from psycopg2 import extras
 from psycopg2.pool import SimpleConnectionPool
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("isoforest-server")
+log = logging.getLogger("isoforest-model")
 
 N_ESTIMATORS = int(os.getenv("N_ESTIMATORS", "200"))
 CONTAMINATION = float(os.getenv("CONTAMINATION", "0.1"))
@@ -35,13 +29,11 @@ TRAIN_BUFFER_SIZE = int(os.getenv("TRAIN_BUFFER_SIZE", "10000"))
 
 MODEL_PATH = os.getenv("MODEL_PATH", "isoforest_perip.joblib")
 ACTIONS_PATH = os.getenv("ACTIONS_PATH", "actions.jsonl")
-BATCH_TARGET = int(os.getenv("BATCH_TARGET", "200"))  # мягкая проверка размера
 
 PG_DSN = os.getenv("PG_DSN", "postgresql://ml:ml@localhost:5432/mlengine")
 PG_SCHEMA = os.getenv("PG_SCHEMA", "public")
 PG_MINCONN = int(os.getenv("PG_MINCONN", "1"))
 PG_MAXCONN = int(os.getenv("PG_MAXCONN", "5"))
-WARMUP_FROM_DB = int(os.getenv("WARMUP_FROM_DB", "1"))  # подогрев модели на history features при старте
 
 
 def parse_ts(iso: str) -> dt.datetime:
@@ -266,6 +258,9 @@ class IsoForestPerIP:
             );
             """)
             cur.execute(f'CREATE INDEX IF NOT EXISTS idx_actions_ts ON "{self._db_schema}".actions(ts);')
+            
+            # Инициализируем таблицы списков
+            self._init_lists_tables(conn)
 
     def _db_insert_events(self, conn, batch: List[Dict[str, Any]]):
         if not batch:
@@ -399,7 +394,7 @@ class IsoForestPerIP:
             self._is_fitted = True
             
             cleanup_result = self.cleanup_old_data(keep_hours=0.1)
-            log.info(f"Cleanup after retrain: {cleanup_result}")
+            log.info("Cleanup after retrain: %s", cleanup_result)
 
         table = []
         actions = []
@@ -527,7 +522,7 @@ class IsoForestPerIP:
         self._train_rows = feats[-TRAIN_BUFFER_SIZE:]
         
         cleanup_result = self.cleanup_old_data(keep_hours=0.1)
-        log.info(f"Cleanup after training: {cleanup_result}")
+        log.info("Cleanup after training: %s", cleanup_result)
         
         return {"trained": True, "rows_used": len(feats), "cleanup": cleanup_result}
 
@@ -586,174 +581,497 @@ class IsoForestPerIP:
                         "error_retention_days": 7
                     }
         except Exception as e:
-            log.error(f"Cleanup failed: {e}")
+            log.error("Cleanup failed: %s", e)
             return {"error": str(e)}
 
-
-# ===================== FastAPI =====================
-class EventsBatch(BaseModel):
-    events: conlist(Dict[str, Any], min_length=1)
-
-model: Optional[IsoForestPerIP] = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model
-    try:
-        if os.path.exists(MODEL_PATH):
-            model = IsoForestPerIP.load(MODEL_PATH)
-            model.actions_path = ACTIONS_PATH
-            log.info(f"Loaded model from {MODEL_PATH}")
-        else:
-            model = IsoForestPerIP(
-                n_estimators=N_ESTIMATORS,
-                contamination=CONTAMINATION,
-                window_minutes=WINDOW_MINUTES,
-                min_train_rows=MIN_TRAIN_ROWS,
-                retrain_every_batches=RETRAIN_EVERY,
-                hard_fail_ratio=HARD_FAIL_RATIO,
-                hard_fail_min=HARD_FAIL_MIN,
-                actions_path=ACTIONS_PATH,
-                db_dsn=PG_DSN,
-                db_schema=PG_SCHEMA,
-                db_minconn=PG_MINCONN,
-                db_maxconn=PG_MAXCONN,
-            )
-            log.info("Initialized fresh model")
-        if WARMUP_FROM_DB:
-            try:
-                warm = model.train_from_db(limit=5000)
-                log.info(f"Warmup from DB: {warm}")
-            except Exception as e:
-                log.warning(f"Warmup skipped: {e}")
-    except Exception:
-        log.exception("Model init failed")
-        raise
-    yield
-
-app = FastAPI(title="IsoForestPerIP Scoring Service", version="2.0.0", lifespan=lifespan)
-
-@app.get("/healthz")
-def healthz():
-    assert model is not None
-    return {"status": "ok", "trained": model._is_fitted, "actions_path": model.actions_path}
-
-@app.post("/score")
-def score_json(batch: EventsBatch = Body(...), write_actions: bool = True):
-    assert model is not None
-    events = batch.events
-    if BATCH_TARGET and len(events) != BATCH_TARGET:
-        log.warning(f"Batch size {len(events)} != target {BATCH_TARGET} (processing anyway)")
-    try:
-        old_path = model.actions_path
-        if not write_actions:
-            model.actions_path = os.devnull
-        result = model.update_and_detect(events)
-        model.actions_path = old_path
-    except Exception as e:
-        log.exception("update_and_detect failed")
-        raise HTTPException(status_code=500, detail=f"scoring failed: {e}")
-
-    table = result.get("table", [])
-    return JSONResponse({
-        "total_events": result.get("total", len(events)),
-        "trained": result.get("trained", False),
-        "actions_written": result.get("actions_written", 0) if write_actions else 0,
-        "top_table": table[:10],
-    })
-
-@app.post("/score-ndjson")
-async def score_ndjson(req: Request, write_actions: bool = True):
-    assert model is not None
-    raw = await req.body()
-    if req.headers.get("content-encoding", "").lower() == "gzip":
+    def get_recent_anomalies(self, limit: int = 20):
+        """Получает последние аномалии из базы данных"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
         try:
-            raw = gzip.decompress(raw)
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        SELECT ts, action, ip, iso_score, recent_failed, recent_events, 
+                               recent_fail_ratio, reason
+                        FROM "{self._db_schema}".actions
+                        ORDER BY ts DESC
+                        LIMIT %s
+                    """, (limit,))
+                    rows = cur.fetchall()
+                    
+                    anomalies = []
+                    for row in rows:
+                        anomalies.append({
+                            "ts": row[0].isoformat() if row[0] else None,
+                            "action": row[1],
+                            "ip": row[2],
+                            "iso_score": float(row[3]) if row[3] is not None else None,
+                            "recent_failed": float(row[4]) if row[4] is not None else None,
+                            "recent_events": float(row[5]) if row[5] is not None else None,
+                            "recent_fail_ratio": float(row[6]) if row[6] is not None else None,
+                            "reason": row[7]
+                        })
+                    
+                    return {
+                        "anomalies": anomalies,
+                        "count": len(anomalies),
+                        "limit": limit
+                    }
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"gzip decompress failed: {e}")
+            log.error("Failed to get recent anomalies: %s", e)
+            return {"error": str(e)}
 
-    ctype = (req.headers.get("content-type") or "").split(";")[0].strip().lower()
-    events: List[Dict[str, Any]] = []
-    try:
-        if ctype == "application/json":
-            parsed = json.loads(raw.decode("utf-8"))
-            if isinstance(parsed, dict) and "events" in parsed:
-                events = parsed["events"]
-            elif isinstance(parsed, list):
-                events = parsed
-            else:
-                raise ValueError("application/json must be array or object with 'events'")
-        else:
-            for ln in raw.decode("utf-8").splitlines():
-                ln = ln.strip()
-                if not ln:
-                    continue
-                events.append(json.loads(ln))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid body: {e}")
+    def get_anomalies_by_ip(self, ip: str, limit: int = 50):
+        """Получает аномалии для конкретного IP адреса"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        SELECT ts, action, ip, iso_score, recent_failed, recent_events, 
+                               recent_fail_ratio, reason
+                        FROM "{self._db_schema}".actions
+                        WHERE ip = %s
+                        ORDER BY ts DESC
+                        LIMIT %s
+                    """, (ip, limit))
+                    rows = cur.fetchall()
+                    
+                    anomalies = []
+                    for row in rows:
+                        anomalies.append({
+                            "ts": row[0].isoformat() if row[0] else None,
+                            "action": row[1],
+                            "ip": row[2],
+                            "iso_score": float(row[3]) if row[3] is not None else None,
+                            "recent_failed": float(row[4]) if row[4] is not None else None,
+                            "recent_events": float(row[5]) if row[5] is not None else None,
+                            "recent_fail_ratio": float(row[6]) if row[6] is not None else None,
+                            "reason": row[7]
+                        })
+                    
+                    return {
+                        "anomalies": anomalies,
+                        "count": len(anomalies),
+                        "ip": ip,
+                        "limit": limit
+                    }
+        except Exception as e:
+            log.error("Failed to get anomalies by IP %s: %s", ip, e)
+            return {"error": str(e)}
 
-    if not events:
-        raise HTTPException(status_code=400, detail="no events")
-    if BATCH_TARGET and len(events) != BATCH_TARGET:
-        log.warning(f"Batch size {len(events)} != target {BATCH_TARGET} (processing anyway)")
+    def get_events_by_ip(self, ip: str, limit: int = 100):
+        """Получает события (логи) для конкретного IP адреса"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        SELECT event_id, ts, source_ip, source_port, dest_ip, dest_port, 
+                               "user", service, sensor, event_type, action, outcome, 
+                               message, protocol, bytes, scenario, metadata
+                        FROM "{self._db_schema}".events
+                        WHERE source_ip = %s
+                        ORDER BY ts DESC
+                        LIMIT %s
+                    """, (ip, limit))
+                    rows = cur.fetchall()
+                    
+                    events = []
+                    for row in rows:
+                        events.append({
+                            "event_id": row[0],
+                            "ts": row[1].isoformat() if row[1] else None,
+                            "source_ip": row[2],
+                            "source_port": row[3],
+                            "dest_ip": row[4],
+                            "dest_port": row[5],
+                            "user": row[6],
+                            "service": row[7],
+                            "sensor": row[8],
+                            "event_type": row[9],
+                            "action": row[10],
+                            "outcome": row[11],
+                            "message": row[12],
+                            "protocol": row[13],
+                            "bytes": float(row[14]) if row[14] is not None else None,
+                            "scenario": row[15],
+                            "metadata": row[16] if row[16] else {}
+                        })
+                    
+                    return {
+                        "events": events,
+                        "count": len(events),
+                        "ip": ip,
+                        "limit": limit
+                    }
+        except Exception as e:
+            log.error("Failed to get events by IP %s: %s", ip, e)
+            return {"error": str(e)}
 
-    try:
-        old_path = model.actions_path
-        if not write_actions:
-            model.actions_path = os.devnull
-        result = model.update_and_detect(events)
-        model.actions_path = old_path
-    except Exception as e:
-        log.exception("update_and_detect failed")
-        raise HTTPException(status_code=500, detail=f"scoring failed: {e}")
+    def get_ips_summary(self, limit: int = 100):
+        """Получает список IP адресов с краткой статистикой"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        SELECT ip, ip_recent_events, ip_recent_failed, ip_recent_fail_ratio
+                        FROM "{self._db_schema}".features
+                        ORDER BY ts DESC
+                        LIMIT %s
+                    """, (limit,))
+                    rows = cur.fetchall()
+                    
+                    ips = []
+                    seen_ips = set()
+                    for row in rows:
+                        ip = row[0]
+                        if ip not in seen_ips:
+                            ips.append({
+                                "ip": ip,
+                                "recent_events": int(row[1]) if row[1] is not None else 0,
+                                "recent_failed": int(row[2]) if row[2] is not None else 0,
+                                "recent_fail_ratio": float(row[3]) if row[3] is not None else 0.0
+                            })
+                            seen_ips.add(ip)
+                    
+                    return {
+                        "ips": ips,
+                        "count": len(ips),
+                        "limit": limit
+                    }
+        except Exception as e:
+            log.error("Failed to get IPs summary: %s", e)
+            return {"error": str(e)}
 
-    table = result.get("table", [])
-    return JSONResponse({
-        "total_events": result.get("total", len(events)),
-        "trained": result.get("trained", False),
-        "actions_written": result.get("actions_written", 0) if write_actions else 0,
-        "top_table": table[:10],
-    })
+    def _init_lists_tables(self, conn):
+        """Инициализирует таблицы для списков"""
+        with conn.cursor() as cur:
+            cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{self._db_schema}".allow_lists (
+                id SERIAL PRIMARY KEY,
+                type TEXT NOT NULL CHECK (type IN ('ip', 'user', 'network')),
+                value TEXT NOT NULL,
+                description TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                expires_at TIMESTAMPTZ,
+                UNIQUE(type, value)
+            );
+            """)
+            cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{self._db_schema}".deny_lists (
+                id SERIAL PRIMARY KEY,
+                type TEXT NOT NULL CHECK (type IN ('ip', 'user', 'network')),
+                value TEXT NOT NULL,
+                description TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                expires_at TIMESTAMPTZ,
+                UNIQUE(type, value)
+            );
+            """)
+            cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{self._db_schema}".suppress_lists (
+                id SERIAL PRIMARY KEY,
+                type TEXT NOT NULL CHECK (type IN ('ip', 'user', 'pattern')),
+                value TEXT NOT NULL,
+                description TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                UNIQUE(type, value)
+            );
+            """)
+            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_allow_type_value ON "{self._db_schema}".allow_lists(type, value);')
+            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_deny_type_value ON "{self._db_schema}".deny_lists(type, value);')
+            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_suppress_type_value ON "{self._db_schema}".suppress_lists(type, value);')
+            cur.execute(f'CREATE INDEX IF NOT EXISTS idx_suppress_expires ON "{self._db_schema}".suppress_lists(expires_at);')
 
-@app.post("/save")
-def save_model():
-    assert model is not None
-    try:
-        model.save(MODEL_PATH)
-        return {"saved": True, "path": MODEL_PATH}
-    except Exception as e:
-        log.exception("save failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    def get_allow_list(self):
+        """Получает список разрешенных IP/пользователей/сетей"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        SELECT id, type, value, description, created_at, expires_at
+                        FROM "{self._db_schema}".allow_lists
+                        WHERE expires_at IS NULL OR expires_at > NOW()
+                        ORDER BY created_at DESC
+                    """)
+                    rows = cur.fetchall()
+                    
+                    items = []
+                    for row in rows:
+                        items.append({
+                            "id": row[0],
+                            "type": row[1],
+                            "value": row[2],
+                            "description": row[3],
+                            "created_at": row[4].isoformat() if row[4] else None,
+                            "expires_at": row[5].isoformat() if row[5] else None
+                        })
+                    
+                    return {"items": items, "count": len(items)}
+        except Exception as e:
+            log.error("Failed to get allow list: %s", e)
+            return {"error": str(e)}
 
-@app.post("/load")
-def load_model():
-    global model
-    try:
-        model = IsoForestPerIP.load(MODEL_PATH)
-        model.actions_path = ACTIONS_PATH
-        return {"loaded": True, "path": MODEL_PATH}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"{MODEL_PATH} not found")
-    except Exception as e:
-        log.exception("load failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    def add_allow_item(self, item_type: str, value: str, description: str = None, expires_at: str = None):
+        """Добавляет элемент в список разрешений"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    expires_sql = "NULL"
+                    if expires_at:
+                        expires_sql = f"'{expires_at}'::timestamptz"
+                    
+                    cur.execute(f"""
+                        INSERT INTO "{self._db_schema}".allow_lists (type, value, description, expires_at)
+                        VALUES (%s, %s, %s, {expires_sql})
+                        ON CONFLICT (type, value) DO UPDATE SET
+                            description = EXCLUDED.description,
+                            expires_at = EXCLUDED.expires_at
+                        RETURNING id, created_at
+                    """, (item_type, value, description))
+                    
+                    result = cur.fetchone()
+                    return {
+                        "id": result[0],
+                        "type": item_type,
+                        "value": value,
+                        "description": description,
+                        "created_at": result[1].isoformat(),
+                        "expires_at": expires_at
+                    }
+        except Exception as e:
+            log.error("Failed to add allow item: %s", e)
+            return {"error": str(e)}
 
-@app.post("/train/from-db")
-def train_from_db(since: Optional[str] = None, until: Optional[str] = None, limit: Optional[int] = 5000):
-    assert model is not None
-    try:
-        res = model.train_from_db(since=since, until=until, limit=limit)
-        return res
-    except Exception as e:
-        log.exception("train_from_db failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    def delete_allow_item(self, item_id: int = None, item_type: str = None, value: str = None):
+        """Удаляет элемент из списка разрешений"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    if item_id:
+                        cur.execute(f"DELETE FROM \"{self._db_schema}\".allow_lists WHERE id = %s", (item_id,))
+                    elif item_type and value:
+                        cur.execute(f"DELETE FROM \"{self._db_schema}\".allow_lists WHERE type = %s AND value = %s", (item_type, value))
+                    else:
+                        return {"error": "Either item_id or (item_type and value) must be provided"}
+                    
+                    return {"deleted": cur.rowcount > 0, "count": cur.rowcount}
+        except Exception as e:
+            log.error("Failed to delete allow item: %s", e)
+            return {"error": str(e)}
 
+    def get_deny_list(self):
+        """Получает список заблокированных IP/пользователей/сетей"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        SELECT id, type, value, description, created_at, expires_at
+                        FROM "{self._db_schema}".deny_lists
+                        WHERE expires_at IS NULL OR expires_at > NOW()
+                        ORDER BY created_at DESC
+                    """)
+                    rows = cur.fetchall()
+                    
+                    items = []
+                    for row in rows:
+                        items.append({
+                            "id": row[0],
+                            "type": row[1],
+                            "value": row[2],
+                            "description": row[3],
+                            "created_at": row[4].isoformat() if row[4] else None,
+                            "expires_at": row[5].isoformat() if row[5] else None
+                        })
+                    
+                    return {"items": items, "count": len(items)}
+        except Exception as e:
+            log.error("Failed to get deny list: %s", e)
+            return {"error": str(e)}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8001")),
-        reload=bool(int(os.getenv("RELOAD", "0"))),
-    )
+    def add_deny_item(self, item_type: str, value: str, description: str = None, expires_at: str = None):
+        """Добавляет элемент в список блокировок"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    expires_sql = "NULL"
+                    if expires_at:
+                        expires_sql = f"'{expires_at}'::timestamptz"
+                    
+                    cur.execute(f"""
+                        INSERT INTO "{self._db_schema}".deny_lists (type, value, description, expires_at)
+                        VALUES (%s, %s, %s, {expires_sql})
+                        ON CONFLICT (type, value) DO UPDATE SET
+                            description = EXCLUDED.description,
+                            expires_at = EXCLUDED.expires_at
+                        RETURNING id, created_at
+                    """, (item_type, value, description))
+                    
+                    result = cur.fetchone()
+                    return {
+                        "id": result[0],
+                        "type": item_type,
+                        "value": value,
+                        "description": description,
+                        "created_at": result[1].isoformat(),
+                        "expires_at": expires_at
+                    }
+        except Exception as e:
+            log.error("Failed to add deny item: %s", e)
+            return {"error": str(e)}
+
+    def delete_deny_item(self, item_id: int = None, item_type: str = None, value: str = None):
+        """Удаляет элемент из списка блокировок"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    if item_id:
+                        cur.execute(f"DELETE FROM \"{self._db_schema}\".deny_lists WHERE id = %s", (item_id,))
+                    elif item_type and value:
+                        cur.execute(f"DELETE FROM \"{self._db_schema}\".deny_lists WHERE type = %s AND value = %s", (item_type, value))
+                    else:
+                        return {"error": "Either item_id or (item_type and value) must be provided"}
+                    
+                    return {"deleted": cur.rowcount > 0, "count": cur.rowcount}
+        except Exception as e:
+            log.error("Failed to delete deny item: %s", e)
+            return {"error": str(e)}
+
+    def add_suppress_item(self, item_type: str, value: str, minutes: int, description: str = None):
+        """Добавляет элемент в список подавления оповещений"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)
+                    
+                    cur.execute(f"""
+                        INSERT INTO "{self._db_schema}".suppress_lists (type, value, description, expires_at)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (type, value) DO UPDATE SET
+                            description = EXCLUDED.description,
+                            expires_at = EXCLUDED.expires_at
+                        RETURNING id, created_at
+                    """, (item_type, value, description, expires_at))
+                    
+                    result = cur.fetchone()
+                    return {
+                        "id": result[0],
+                        "type": item_type,
+                        "value": value,
+                        "description": description,
+                        "created_at": result[1].isoformat(),
+                        "expires_at": expires_at.isoformat(),
+                        "minutes": minutes
+                    }
+        except Exception as e:
+            log.error("Failed to add suppress item: %s", e)
+            return {"error": str(e)}
+
+    def export_actions_ndjson(self, since: str = None, until: str = None, limit: int = 10000):
+        """Экспортирует аномалии в формате NDJSON для SIEM"""
+        if not self._db_dsn:
+            return {"error": "PostgreSQL DSN is not configured"}
+        
+        try:
+            self._ensure_pool()
+            with self._db() as conn:
+                with conn.cursor() as cur:
+                    query = f"""
+                        SELECT ts, action, ip, iso_score, recent_failed, recent_events, 
+                               recent_fail_ratio, reason
+                        FROM "{self._db_schema}".actions
+                    """
+                    params = []
+                    conditions = []
+                    
+                    if since:
+                        conditions.append("ts >= %s")
+                        params.append(since)
+                    if until:
+                        conditions.append("ts <= %s")
+                        params.append(until)
+                    
+                    if conditions:
+                        query += " WHERE " + " AND ".join(conditions)
+                    
+                    query += " ORDER BY ts DESC"
+                    
+                    if limit:
+                        query += " LIMIT %s"
+                        params.append(limit)
+                    
+                    cur.execute(query, params)
+                    rows = cur.fetchall()
+                    
+                    ndjson_lines = []
+                    for row in rows:
+                        record = {
+                            "timestamp": row[0].isoformat() if row[0] else None,
+                            "action": row[1],
+                            "source_ip": row[2],
+                            "anomaly_score": float(row[3]) if row[3] is not None else None,
+                            "recent_failed_attempts": int(row[4]) if row[4] is not None else 0,
+                            "recent_total_events": int(row[5]) if row[5] is not None else 0,
+                            "failure_ratio": float(row[6]) if row[6] is not None else 0.0,
+                            "reason": row[7],
+                            "event_type": "anomaly_detection",
+                            "severity": "high" if row[1] == "block_ip" else "medium",
+                            "source": "ml-detector",
+                            "exported_at": dt.datetime.now(dt.timezone.utc).isoformat()
+                        }
+                        ndjson_lines.append(json.dumps(record, ensure_ascii=False))
+                    
+                    return {
+                        "ndjson": "\n".join(ndjson_lines),
+                        "count": len(ndjson_lines),
+                        "since": since,
+                        "until": until,
+                        "limit": limit
+                    }
+        except Exception as e:
+            log.error("Failed to export actions NDJSON: %s", e)
+            return {"error": str(e)}
+

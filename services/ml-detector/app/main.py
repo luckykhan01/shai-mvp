@@ -29,11 +29,34 @@ RETRAIN_LOOKBACK_MIN = int(os.getenv("RETRAIN_LOOKBACK_MIN", "60"))    # окн�
 RETRAIN_DB_LIMIT     = int(os.getenv("RETRAIN_DB_LIMIT", "20000"))     # ограничение строк из БД
 WARMUP_FROM_DB       = int(os.getenv("WARMUP_FROM_DB", "1"))           # подогреться из БД на старте
 
+# Database configuration
+PG_DSN = os.getenv("PG_DSN", "postgresql://ml:ml@localhost:5432/mlengine")
+PG_SCHEMA = os.getenv("PG_SCHEMA", "public")
+PG_MINCONN = int(os.getenv("PG_MINCONN", "1"))
+PG_MAXCONN = int(os.getenv("PG_MAXCONN", "5"))
+
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("serve_isoforest")
 
 class EventsBatch(BaseModel):
     events: conlist(Dict[str, Any], min_length=1)
+
+class ListItem(BaseModel):
+    type: str
+    value: str
+    description: Optional[str] = None
+    expires_at: Optional[str] = None
+
+class SuppressItem(BaseModel):
+    type: str
+    value: str
+    minutes: int
+    description: Optional[str] = None
+
+class DeleteItem(BaseModel):
+    item_id: Optional[int] = None
+    item_type: Optional[str] = None
+    value: Optional[str] = None
 
 model: Optional[IsoForestPerIP] = None
 
@@ -72,6 +95,10 @@ async def lifespan(app: FastAPI):
                 hard_fail_ratio=HARD_FAIL_RATIO,
                 hard_fail_min=HARD_FAIL_MIN,
                 actions_path=ACTIONS_PATH,
+                db_dsn=PG_DSN,
+                db_schema=PG_SCHEMA,
+                db_minconn=PG_MINCONN,
+                db_maxconn=PG_MAXCONN,
             )
             log.info("Initialized fresh model")
     except Exception:
@@ -85,6 +112,10 @@ async def lifespan(app: FastAPI):
             hard_fail_ratio=HARD_FAIL_RATIO,
             hard_fail_min=HARD_FAIL_MIN,
             actions_path=ACTIONS_PATH,
+            db_dsn=PG_DSN,
+            db_schema=PG_SCHEMA,
+            db_minconn=PG_MINCONN,
+            db_maxconn=PG_MAXCONN,
         )
 
     if WARMUP_FROM_DB:
@@ -217,6 +248,200 @@ def cleanup_old_data(keep_hours: int = 24):
         return result
     except Exception as e:
         log.exception("cleanup failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/anomalies")
+def get_anomalies(limit: int = 20):
+    """Получить последние аномалии"""
+    assert model is not None
+    try:
+        result = model.get_recent_anomalies(limit=limit)
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("get_anomalies failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/anomalies/{ip}")
+def get_anomalies_by_ip(ip: str, limit: int = 50):
+    """Получить аномалии для конкретного IP адреса"""
+    assert model is not None
+    try:
+        result = model.get_anomalies_by_ip(ip=ip, limit=limit)
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("get_anomalies_by_ip failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/features/{ip}")
+def get_features(ip: str, limit: int = 100):
+    """Получить события (логи) для конкретного IP адреса"""
+    assert model is not None
+    try:
+        result = model.get_events_by_ip(ip=ip, limit=limit)
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("get_features failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/ips")
+def list_ips(limit: int = 100):
+    """Получить список IP адресов с краткой статистикой"""
+    assert model is not None
+    try:
+        result = model.get_ips_summary(limit=limit)
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("list_ips failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Allow List endpoints
+@app.get("/lists/allow")
+def get_allow_list():
+    """Получить список разрешенных IP/пользователей/сетей"""
+    assert model is not None
+    try:
+        result = model.get_allow_list()
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("get_allow_list failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/lists/allow")
+def add_allow_item(item: ListItem):
+    """Добавить элемент в список разрешений"""
+    assert model is not None
+    try:
+        result = model.add_allow_item(
+            item_type=item.type,
+            value=item.value,
+            description=item.description,
+            expires_at=item.expires_at
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("add_allow_item failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/lists/allow")
+def delete_allow_item(item: DeleteItem):
+    """Удалить элемент из списка разрешений"""
+    assert model is not None
+    try:
+        result = model.delete_allow_item(
+            item_id=item.item_id,
+            item_type=item.item_type,
+            value=item.value
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("delete_allow_item failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Deny List endpoints
+@app.get("/lists/deny")
+def get_deny_list():
+    """Получить список заблокированных IP/пользователей/сетей"""
+    assert model is not None
+    try:
+        result = model.get_deny_list()
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("get_deny_list failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/lists/deny")
+def add_deny_item(item: ListItem):
+    """Добавить элемент в список блокировок"""
+    assert model is not None
+    try:
+        result = model.add_deny_item(
+            item_type=item.type,
+            value=item.value,
+            description=item.description,
+            expires_at=item.expires_at
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("add_deny_item failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/lists/deny")
+def delete_deny_item(item: DeleteItem):
+    """Удалить элемент из списка блокировок"""
+    assert model is not None
+    try:
+        result = model.delete_deny_item(
+            item_id=item.item_id,
+            item_type=item.item_type,
+            value=item.value
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("delete_deny_item failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Suppress endpoint
+@app.post("/suppress")
+def suppress_alerts(item: SuppressItem):
+    """Временно подавить оповещения по IP/пользователю/паттерну"""
+    assert model is not None
+    try:
+        result = model.add_suppress_item(
+            item_type=item.type,
+            value=item.value,
+            minutes=item.minutes,
+            description=item.description
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except Exception as e:
+        log.exception("suppress_alerts failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/export/actions.ndjson")
+def export_actions_ndjson(since: str = None, until: str = None, limit: int = 10000):
+    """Экспорт аномалий в формате NDJSON для SIEM"""
+    assert model is not None
+    try:
+        result = model.export_actions_ndjson(since=since, until=until, limit=limit)
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        # Возвращаем NDJSON как plain text
+        return JSONResponse(
+            content=result["ndjson"],
+            media_type="application/x-ndjson",
+            headers={
+                "Content-Disposition": f"attachment; filename=anomalies_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.ndjson",
+                "X-Total-Count": str(result["count"]),
+                "X-Since": since or "",
+                "X-Until": until or "",
+                "X-Limit": str(limit)
+            }
+        )
+    except Exception as e:
+        log.exception("export_actions_ndjson failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
