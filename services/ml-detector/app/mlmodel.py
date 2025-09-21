@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# server.py
-# FastAPI + IsolationForest (per-IP recent window) + PostgreSQL storage
 from __future__ import annotations
 
 import os, json, gzip, logging, datetime as dt, statistics as stats
@@ -23,12 +20,10 @@ from psycopg2 import extras
 from psycopg2.pool import SimpleConnectionPool
 
 
-# ===================== Config =====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("isoforest-server")
 
-# Model hyperparams / behavior
 N_ESTIMATORS = int(os.getenv("N_ESTIMATORS", "200"))
 CONTAMINATION = float(os.getenv("CONTAMINATION", "0.1"))
 WINDOW_MINUTES = int(os.getenv("WINDOW_MINUTES", "10"))
@@ -38,12 +33,10 @@ HARD_FAIL_RATIO = float(os.getenv("HARD_FAIL_RATIO", "0.95"))
 HARD_FAIL_MIN = int(os.getenv("HARD_FAIL_MIN", "20"))
 TRAIN_BUFFER_SIZE = int(os.getenv("TRAIN_BUFFER_SIZE", "10000"))
 
-# IO
 MODEL_PATH = os.getenv("MODEL_PATH", "isoforest_perip.joblib")
 ACTIONS_PATH = os.getenv("ACTIONS_PATH", "actions.jsonl")
 BATCH_TARGET = int(os.getenv("BATCH_TARGET", "200"))  # мягкая проверка размера
 
-# PostgreSQL
 PG_DSN = os.getenv("PG_DSN", "postgresql://ml:ml@localhost:5432/mlengine")
 PG_SCHEMA = os.getenv("PG_SCHEMA", "public")
 PG_MINCONN = int(os.getenv("PG_MINCONN", "1"))
@@ -51,12 +44,10 @@ PG_MAXCONN = int(os.getenv("PG_MAXCONN", "5"))
 WARMUP_FROM_DB = int(os.getenv("WARMUP_FROM_DB", "1"))  # подогрев модели на history features при старте
 
 
-# ===================== Utilities =====================
 def parse_ts(iso: str) -> dt.datetime:
     return dt.datetime.fromisoformat(iso)
 
 
-# ===================== Per-IP window =====================
 class PerIPWindow:
     """Буфер per-IP. Окно якорится на last_seen (ts текущего события)."""
 
@@ -98,7 +89,6 @@ class PerIPWindow:
             for a, b in zip(times[:-1], times[1:]):
                 inter.append((b - a).total_seconds())
 
-        # burst за 60 сек
         burst_max = 0
         i = 0
         for j in range(len(times)):
@@ -126,7 +116,6 @@ class PerIPWindow:
         return list(self._buf.keys())
 
 
-# ===================== Model =====================
 class IsoForestPerIP:
     def __init__(
         self,
@@ -147,7 +136,6 @@ class IsoForestPerIP:
         db_minconn: int = PG_MINCONN,
         db_maxconn: int = PG_MAXCONN,
     ):
-        # algo
         self._clf = IsolationForest(
             n_estimators=n_estimators,
             contamination=contamination,
@@ -159,7 +147,6 @@ class IsoForestPerIP:
         self._vec = DictVectorizer(sparse=True)
         self._is_fitted = False
 
-        # behavior
         self._perip = PerIPWindow(window=dt.timedelta(minutes=window_minutes))
         self._train_rows: List[Dict[str, Any]] = []
         self._batches_seen = 0
@@ -167,11 +154,9 @@ class IsoForestPerIP:
         self._min_train_rows = min_train_rows
         self._retrain_every_batches = retrain_every_batches
 
-        # actions thresholds
         self._hard_fail_ratio = hard_fail_ratio
         self._hard_fail_min = hard_fail_min
 
-        # IO
         self.actions_path = actions_path
         self._model_params = {
             "n_estimators": n_estimators,
@@ -199,7 +184,6 @@ class IsoForestPerIP:
         self._db_maxconn = db_maxconn
         self._pool: Optional[SimpleConnectionPool] = None
 
-    # --------- DB helpers (PostgreSQL) ---------
     def _ensure_pool(self):
         if not self._db_dsn:
             return
@@ -367,7 +351,6 @@ class IsoForestPerIP:
                 ) VALUES %s;
             """, rows, page_size=200)
 
-    # --------- Vec helpers ---------
     def _vectorize_fit(self, feats: List[Dict[str, Any]]):
         self._vec = DictVectorizer(sparse=True)
         return self._vec.fit_transform(feats)
@@ -384,21 +367,18 @@ class IsoForestPerIP:
             for a in actions:
                 fh.write(json.dumps(a, ensure_ascii=False) + "\n")
 
-    # --------- Main update & detect ---------
     def update_and_detect(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not isinstance(batch, list) or (batch and not isinstance(batch[0], dict)):
             raise TypeError("Batch must be List[Dict[str, Any]]")
         if not batch:
             return {"total": 0, "table": [], "actions_written": 0, "trained": self._is_fitted}
 
-        # 1) записываем события в БД и вносим в per-IP буфер
         with self._db() as conn:
             if conn is not None:
                 self._db_insert_events(conn, batch)
         for ev in batch:
             self._perip.push(ev)
 
-        # 2) собираем фичи по всем текущим IP
         ips = self._perip.current_ips()
         ip_feats: List[Dict[str, Any]] = []
         for ip in ips:
@@ -406,13 +386,11 @@ class IsoForestPerIP:
             f["ip"] = ip
             ip_feats.append(f)
 
-        # буфер обучения (RAM)
         self._train_rows.extend([{k: v for k, v in row.items() if k != "ip"} for row in ip_feats])
         if len(self._train_rows) > self._train_buffer_size:
             self._train_rows = self._train_rows[-self._train_buffer_size:]
         self._batches_seen += 1
 
-        # (пере)обучение
         need_initial_fit = (not self._is_fitted) and (len(self._train_rows) >= self._min_train_rows)
         need_retrain = self._is_fitted and (self._batches_seen % self._retrain_every_batches == 0)
         if need_initial_fit or need_retrain:
@@ -420,11 +398,9 @@ class IsoForestPerIP:
             self._clf.fit(Xtrain)
             self._is_fitted = True
             
-            # Очистка старых данных после переобучения (обычные данные старше 6 минут)
             cleanup_result = self.cleanup_old_data(keep_hours=0.1)
             log.info(f"Cleanup after retrain: {cleanup_result}")
 
-        # 3) предсказание по IP-строкам
         table = []
         actions = []
         if self._is_fitted:
@@ -468,7 +444,6 @@ class IsoForestPerIP:
                     "iso_pred": None,
                 })
 
-        # 4) запись actions на диск и в БД + снапшоты features
         self._append_actions_file(actions)
         with self._db() as conn:
             if conn is not None:
@@ -476,7 +451,6 @@ class IsoForestPerIP:
                 self._db_insert_features(conn, now_iso, ip_feats)
                 self._db_insert_actions(conn, actions)
 
-        # сортировка по iso_score (меньше — аномальнее)
         table_sorted = sorted(table, key=lambda r: (r["iso_score"] if r["iso_score"] is not None else float("inf")))
         return {
             "total": len(batch),
@@ -485,7 +459,6 @@ class IsoForestPerIP:
             "actions_written": len(actions),
         }
 
-    # --------- Persistence ---------
     def save(self, path: str):
         payload = {
             "params": self._model_params,
@@ -508,7 +481,6 @@ class IsoForestPerIP:
         obj._batches_seen = payload["_batches_seen"]
         return obj
 
-    # --------- Train from DB (historical) ---------
     def train_from_db(self, since: Optional[str] = None, until: Optional[str] = None, limit: Optional[int] = 5000):
         if not self._db_dsn:
             raise RuntimeError("PostgreSQL DSN is not configured")
@@ -554,7 +526,6 @@ class IsoForestPerIP:
         self._is_fitted = True
         self._train_rows = feats[-TRAIN_BUFFER_SIZE:]
         
-        # Очистка старых данных после обучения (обычные данные старше 6 минут)
         cleanup_result = self.cleanup_old_data(keep_hours=0.1)
         log.info(f"Cleanup after training: {cleanup_result}")
         
@@ -569,8 +540,6 @@ class IsoForestPerIP:
             self._ensure_pool()
             with self._db() as conn:
                 with conn.cursor() as cur:
-                    # Удаляем старые события (кроме ошибок)
-                    # Обычные события удаляем через keep_hours, ошибки сохраняем 7 дней
                     cur.execute("""
                         DELETE FROM events 
                         WHERE ts < NOW() - INTERVAL '%s hours'
@@ -578,15 +547,12 @@ class IsoForestPerIP:
                     """, (keep_hours,))
                     events_deleted = cur.rowcount
                     
-                    # Удаляем старые features (все, так как они не содержат ошибки)
                     cur.execute("""
                         DELETE FROM features 
                         WHERE ts < NOW() - INTERVAL '%s hours'
                     """, (keep_hours,))
                     features_deleted = cur.rowcount
                     
-                    # Удаляем старые actions (кроме аномальных)
-                    # Аномальные actions сохраняем 7 дней, обычные удаляем через keep_hours
                     cur.execute("""
                         DELETE FROM actions 
                         WHERE ts < NOW() - INTERVAL '%s hours'
@@ -594,7 +560,6 @@ class IsoForestPerIP:
                     """, (keep_hours,))
                     actions_deleted = cur.rowcount
                     
-                    # Дополнительно удаляем очень старые ошибки (старше 7 дней)
                     cur.execute("""
                         DELETE FROM events 
                         WHERE ts < NOW() - INTERVAL '7 days'
@@ -627,7 +592,6 @@ class IsoForestPerIP:
 
 # ===================== FastAPI =====================
 class EventsBatch(BaseModel):
-    # Pydantic v2: min_length вместо min_items
     events: conlist(Dict[str, Any], min_length=1)
 
 model: Optional[IsoForestPerIP] = None
@@ -635,7 +599,6 @@ model: Optional[IsoForestPerIP] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model
-    # попытка загрузить модель с диска, иначе новая
     try:
         if os.path.exists(MODEL_PATH):
             model = IsoForestPerIP.load(MODEL_PATH)
@@ -667,10 +630,6 @@ async def lifespan(app: FastAPI):
         log.exception("Model init failed")
         raise
     yield
-    # shutdown hook (можно автосейв)
-    # try:
-    #     model.save(MODEL_PATH)
-    # except Exception:
 
 app = FastAPI(title="IsoForestPerIP Scoring Service", version="2.0.0", lifespan=lifespan)
 
@@ -686,7 +645,6 @@ def score_json(batch: EventsBatch = Body(...), write_actions: bool = True):
     if BATCH_TARGET and len(events) != BATCH_TARGET:
         log.warning(f"Batch size {len(events)} != target {BATCH_TARGET} (processing anyway)")
     try:
-        # можно временно отключить запись в файл (actions.jsonl)
         old_path = model.actions_path
         if not write_actions:
             model.actions_path = os.devnull
@@ -704,7 +662,6 @@ def score_json(batch: EventsBatch = Body(...), write_actions: bool = True):
         "top_table": table[:10],
     })
 
-# NDJSON (по строкам), поддержка gzip
 @app.post("/score-ndjson")
 async def score_ndjson(req: Request, write_actions: bool = True):
     assert model is not None
@@ -792,7 +749,6 @@ def train_from_db(since: Optional[str] = None, until: Optional[str] = None, limi
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============ Local runner ============
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(

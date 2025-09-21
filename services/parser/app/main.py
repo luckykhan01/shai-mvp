@@ -1,15 +1,11 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 import os, json, uuid
 from typing import List, Optional, Union
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# берём функцию detect_and_parse из parser_normalizer.py
 from parser_normalizer import detect_and_parse
 
-# куда писать нормализованные события
 OUT_FILE = os.environ.get("OUT_FILE", "normalized.jsonl")
 
 app = FastAPI(title="Log Receiver & Normalizer (to file)", version="1.0.0")
@@ -32,13 +28,11 @@ async def ingest(payload: Union[IngestPayload, None] = None, request: Request = 
     """
     raw_lines: List[str] = []
 
-    # если text/plain
     if request and request.headers.get("content-type","").startswith("text/plain"):
         body = await request.body()
         text = body.decode("utf-8", errors="ignore")
         raw_lines = [l for l in text.splitlines() if l.strip()]
     else:
-        # json
         try:
             data = payload.dict() if payload else {}
         except Exception:
@@ -55,7 +49,6 @@ async def ingest(payload: Union[IngestPayload, None] = None, request: Request = 
         ok, obj = detect_and_parse(l)
         (normalized if ok else errors).append(obj)
 
-    # append в файл
     if normalized:
         with open(OUT_FILE, "a", encoding="utf-8") as f:
             for obj in normalized:

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse, random, sys, time, os
 from datetime import datetime, timezone
 import requests
@@ -85,11 +84,8 @@ def send_event(event: dict, save: bool = True, timeout: float = 2.0):
     try:
         r = requests.post(INGEST_URL, json=payload, timeout=timeout)
         r.raise_for_status()
-        # optionally parse/print response for debugging:
-        # print("sent OK:", r.json())
         return True
     except requests.exceptions.RequestException as e:
-        # minimal error output; replace with logging if desired
         print(f"[send_event] failed to send (url={INGEST_URL}): {e}", file=sys.stderr)
         return False
     except Exception as e:
@@ -131,9 +127,7 @@ def main():
     fh = sys.stdout if args.out == "-" else open(args.out, "w", encoding="utf-8")
     try:
         if args.realtime:
-            # Infinite loop for realtime mode
             while True:
-                # Generate one event at a time
                 if args.scenario == "normal":
                     ln = gen_normal(1)[0]
                 elif args.scenario == "bad_ip":
@@ -141,29 +135,21 @@ def main():
                 elif args.scenario == "scan":
                     ln = gen_scan(1, attacker=args.attacker_ip or None, target=args.target_ip or None)[0]
                 
-                # write to file/stdout
                 fh.write(ln + "\n")
                 fh.flush()
 
-                # send over HTTP unless --nosend provided
                 if not args.nosend:
                     payload = {"line": ln}
-                    # pass save flag from CLI (useful for receiver behavior)
                     send_event(payload, save=bool(args.save))
 
-                # realtime pacing
                 time.sleep(0.01)
         else:
-            # Original batch mode
             for ln in lines:
-                # write to file/stdout
                 fh.write(ln + "\n")
                 fh.flush()
 
-                # send over HTTP unless --nosend provided
                 if not args.nosend:
                     payload = {"line": ln}
-                    # pass save flag from CLI (useful for receiver behavior)
                     send_event(payload, save=bool(args.save))
     finally:
         if fh is not sys.stdout:

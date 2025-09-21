@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""
-shipper.py
-
-Reads a JSONL file (normalized events), sends new events in batches to ML /score endpoint,
-and maintains a checkpoint file to avoid resending events across restarts.
-
-Usage:
-  python shipper.py --file normalized.jsonl --ml http://localhost:8001/score --batch 200 --interval 0.5
-
-It supports:
- - checkpointing (default: shipper.checkpoint)
- - batch size and flush interval
- - exponential backoff retries on sender errors
-"""
 import argparse
 import json
 import os
@@ -61,11 +46,10 @@ def tail_batch(file_path: str, start_offset: int, max_lines: int):
             pos_before = fh.tell()
             line = fh.readline()
             if not line:
-                # EOF: вернуть позицию до чтения пустой строки (последняя валидная позиция)
                 new_offset = pos_before
                 break
 
-            new_offset = fh.tell()  # позиция сразу после прочитанной строки
+            new_offset = fh.tell()  
             s = line.strip()
             if s:
                 try:
@@ -77,7 +61,7 @@ def tail_batch(file_path: str, start_offset: int, max_lines: int):
     return events, new_offset
 
 def ship_batch(ml_url: str, batch: List[dict], max_retries: int = 6, initial_backoff: float = 0.5) -> bool:
-    """Send batch to ML. Return True on success, False on permanent failure."""
+    """Send batch to ML. Return True on success, False on failure."""
     if not batch:
         return True
     payload = {"events": batch}
@@ -103,12 +87,10 @@ def run_loop(file_path: str, ml_url: str, checkpoint_path: str, batch_size: int,
     buffer = []
     last_flush = time.time()
 
-    # Ensure file exists
     if not os.path.exists(file_path):
         logger.warning("Input file %s does not exist yet. Waiting...", file_path)
 
     while True:
-        # Try to open and read next events
         try:
             size = os.path.getsize(file_path)
             if offset > size:
@@ -116,7 +98,6 @@ def run_loop(file_path: str, ml_url: str, checkpoint_path: str, batch_size: int,
                 offset = 0
                 write_checkpoint(checkpoint_path, offset)
         except FileNotFoundError:
-            # файла еще нет — подождем ниже
             pass
         try:
             events, new_offset = tail_batch(file_path, offset, max_lines=batch_size - len(buffer) if batch_size > len(buffer) else 0)
@@ -138,20 +119,16 @@ def run_loop(file_path: str, ml_url: str, checkpoint_path: str, batch_size: int,
             should_flush = True
 
         if should_flush:
-            # attempt to ship
             ok = ship_batch(ml_url, buffer)
             if ok:
-                # move checkpoint forward and clear buffer
                 write_checkpoint(checkpoint_path, offset)
                 logger.info("Wrote checkpoint offset=%d", offset)
                 buffer = []
                 last_flush = time.time()
             else:
-                # shipping failed permanently for this batch: wait and retry later; do not update checkpoint
                 logger.warning("Shipping failed; will retry after delay")
                 time.sleep(1.0)
 
-        # if no events and file not growing, sleep
         if not events:
             time.sleep(poll_interval)
 

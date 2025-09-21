@@ -1,12 +1,7 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 import re, uuid, json
 from datetime import datetime, timezone
 import logging
 
-# ---------- REGEX-паттерны ----------
-# 1) AUTH/SYSLOG (sshd):
-# Sep 20 12:01:33 server1 sshd[1234]: Failed password for root from 185.23.54.11 port 54321 ssh2
 AUTH_RE = re.compile(
     r'^(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+'
     r'(?P<host>\S+)\s+sshd\[\d+\]:\s+'
@@ -14,8 +9,6 @@ AUTH_RE = re.compile(
     r'(?P<src_ip>\d{1,3}(?:\.\d{1,3}){3})\s+port\s+(?P<src_port>\d+)\s+ssh2'
 )
 
-# 2) FIREWALL/IDS:
-# 2025-09-20T12:02:10Z firewall: DENY TCP 185.23.54.11:443 -> 10.0.0.5:22
 FW_RE = re.compile(
     r'^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+firewall:\s+'
     r'(?P<action>ALLOW|DENY)\s+(?P<proto>[A-Z]+)\s+'
@@ -23,8 +16,6 @@ FW_RE = re.compile(
     r'(?P<dst_ip>\d{1,3}(?:\.\d{1,3}){3}):(?P<dst_port>\d+)'
 )
 
-# 3) APP/SERVICE:
-# 2025-09-20 12:03:55,101 ERROR billing-service OrderProcessor - NullPointerException at line 123
 APP_RE = re.compile(
     r'^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d{3})\s+'
     r'(?P<level>ERROR|WARN|INFO|DEBUG)\s+'
@@ -62,7 +53,6 @@ def detect_and_parse(line: str):
     """
     line = (line or "").rstrip("\n")
 
-    # AUTH
     m = AUTH_RE.match(line)
     if m:
         logging.info("Auth")
@@ -90,13 +80,12 @@ def detect_and_parse(line: str):
             "metadata": {}
         }
 
-    # FIREWALL
     m = FW_RE.match(line)
     if m:
         logging.info("fw")
         print("fw")
         d = m.groupdict()
-        action = d['action'].lower()         # allow|deny
+        action = d['action'].lower()        
         outcome = 'success' if action == 'allow' else 'blocked'
         return True, {
             "event_id": str(uuid.uuid4()),
@@ -112,13 +101,12 @@ def detect_and_parse(line: str):
             "action": action,
             "outcome": outcome,
             "message": _mask_secrets(line),
-            "protocol": d['proto'].lower(),  # tcp/udp/…
+            "protocol": d['proto'].lower(),  
             "bytes": None,
             "scenario": None,
             "metadata": {}
         }
 
-    # APP
     m = APP_RE.match(line)
     if m:
         logging.info("app")
@@ -147,11 +135,8 @@ def detect_and_parse(line: str):
             "metadata": {"component": d['component'], "level": d['level']}
         }
 
-    # UNKNOWN
     return False, {"error": "unrecognized_format", "raw": line}
 
-# --- опциональн
-# о: быстрый CLI ---
 if __name__ == "__main__":
     import sys
     for raw in sys.stdin:
