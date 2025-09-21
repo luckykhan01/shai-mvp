@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, conlist
 from starlette.responses import JSONResponse
 
@@ -137,6 +138,15 @@ async def lifespan(app: FastAPI):
             pass
 
 app = FastAPI(title="IsoForestPerIP Scoring Service", version="1.1.0", lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/healthz")
 def healthz():

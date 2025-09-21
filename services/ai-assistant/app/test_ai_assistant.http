@@ -1,0 +1,20 @@
+### AI Assistant API Tests
+
+### Health Check
+GET http://localhost:8002/health
+
+### Get Security Status
+GET http://localhost:8002/status
+
+### Analyze Specific IP
+GET http://localhost:8002/analyze/192.168.1.100
+
+### Get Security Recommendations
+GET http://localhost:8002/recommendations
+
+### Get Security Summary
+GET http://localhost:8002/summary
+
+### Test with different IPs
+GET http://localhost:8002/analyze/10.0.0.50
+GET http://localhost:8002/analyze/172.16.0.100
