@@ -1,63 +1,64 @@
-from fastapi import FastAPI, HTTPException
+import os, json, uuid
+from typing import List, Optional, Union
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List
-import time, uuid
 
-app = FastAPI(title="parser", version="0.1")
+from parser_normalizer import detect_and_parse
 
-EVENTS = []
-INCIDENTS = {}
-BLOCKLIST = set()
+OUT_FILE = os.environ.get("OUT_FILE", "normalized.jsonl")
 
-class Event(BaseModel):
-    timestamp: str
-    event_id: str
-    src_ip: str
-    dst_ip: str | None = None
-    dst_port: int | None = None
-    service: str | None = None
-    severity: str | None = None
-    message: str | None = None
-    origin: str | None = None
+app = FastAPI(title="Log Receiver & Normalizer (to file)", version="1.0.0")
 
-@app.get("/healthz")
+class IngestPayload(BaseModel):
+    line: Optional[str] = None
+    lines: Optional[List[str]] = None
+
+@app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "out_file": OUT_FILE}
 
-@app.post("/ingest")
-async def ingest(batch: List[Event]):
-    for e in batch:
-        rec = e.dict()
-        rec["blocked"] = rec["src_ip"] in BLOCKLIST
-        EVENTS.append(rec)
-        # простое правило: если в message есть "Failed" -> инцидент
-        if "Failed" in (rec.get("message") or ""):
-            ip = rec["src_ip"]
-            INCIDENTS.setdefault(ip, {"ip": ip, "events": [], "status": "open", "created": time.time()})["events"].append(rec)
-    return {"received": len(batch)}
+@app.post("/ingest", response_class=JSONResponse)
+async def ingest(payload: Union[IngestPayload, None] = None, request: Request = None):
+    """
+    Принимает:
+    - text/plain: просто строки логов (\n-разделённые)
+    - application/json: {"line": "..."} или {"lines": ["...","..."]}
+    Парсит и сохраняет в OUT_FILE (JSONL).
+    """
+    raw_lines: List[str] = []
 
-@app.get("/incidents")
-async def get_incidents():
-    return {"incidents": list(INCIDENTS.values())}
+    if request and request.headers.get("content-type","").startswith("text/plain"):
+        body = await request.body()
+        text = body.decode("utf-8", errors="ignore")
+        raw_lines = [l for l in text.splitlines() if l.strip()]
+    else:
+        try:
+            data = payload.dict() if payload else {}
+        except Exception:
+            data = await request.json()
+        if data.get("line"):
+            raw_lines = [data["line"]]
+        elif data.get("lines"):
+            raw_lines = [l for l in data["lines"] if l.strip()]
+        else:
+            raise HTTPException(status_code=400, detail="Need 'line' or 'lines'")
 
-@app.post("/simulate_block")
-async def simulate_block(payload: dict):
-    ip = payload.get("ip")
-    actor = payload.get("actor", "demo_user")
-    if not ip:
-        raise HTTPException(status_code=400, detail="no ip")
-    BLOCKLIST.add(ip)
-    if ip in INCIDENTS:
-        INCIDENTS[ip]["status"] = "mitigated"
-        INCIDENTS[ip].setdefault("actions",[]).append({"action":"simulate_block","by":actor,"ts":time.time()})
-    # добавить событие-лог действия
-    EVENTS.append({
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "event_id": str(uuid.uuid4()),
-        "src_ip": ip,
-        "message": f"Action: block simulated for {ip} by {actor}",
-        "service": "controller",
-        "severity": "info",
-        "blocked": True
-    })
-    return {"result": "simulated", "ip": ip}
+    normalized, errors = [], []
+    for l in raw_lines:
+        ok, obj = detect_and_parse(l)
+        (normalized if ok else errors).append(obj)
+
+    if normalized:
+        with open(OUT_FILE, "a", encoding="utf-8") as f:
+            for obj in normalized:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    return {
+        "received": len(raw_lines),
+        "saved": len(normalized),
+        "errors": len(errors),
+        "sample": normalized[:2],
+        "errors_sample": errors[:2],
+        "out_file": OUT_FILE
+    }

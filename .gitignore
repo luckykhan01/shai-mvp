@@ -6,3 +6,7 @@ services/parser/app/.idea
 services/parser/app/.venv
 .DS_Store
 .idea/
+HAKATHON_GUIDE.md
+Shai.pro Case.docx
+shai.pro.txt
+env.example

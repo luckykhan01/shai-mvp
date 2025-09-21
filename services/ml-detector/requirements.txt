@@ -1,3 +1,9 @@
 fastapi
 uvicorn[standard]
 pydantic
+scikit-learn
+numpy
+pandas
+joblib
+python-dateutil
+psycopg2-binary
