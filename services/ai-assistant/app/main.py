@@ -44,7 +44,7 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable is required")
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # Конфигурация ML детектора
 ML_DETECTOR_URL = os.getenv("ML_DETECTOR_URL", "http://ml-detector:8000")
