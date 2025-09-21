@@ -96,8 +96,9 @@ test-parser:
 
 # Show incidents (placeholder - parser doesn't have incidents endpoint anymore)
 incidents:
-	@echo "Incidents endpoint not available in current parser version"
-	@echo "Use 'make test-parser' to test log parsing instead"
+	@curl -s http://localhost:8000/incidents | (command -v jq >/dev/null && jq . || (command -v python3 >/dev/null && python3 -m json.tool || cat))
+
+
 
 # Show ML statistics
 ml-stats:
