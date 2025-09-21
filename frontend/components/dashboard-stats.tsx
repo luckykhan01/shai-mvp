@@ -87,10 +87,20 @@ export function DashboardStats() {
       const trend = Math.random() * 20 - 10 // Временная заглушка для тренда
       
       setStats(prevStats => {
-        // Накопление данных - добавляем новые к существующим
-        const allAnomalies = [...prevStats.accumulatedData.allAnomalies, ...newAnomalies].slice(-1000)
-        const allEvents = [...prevStats.accumulatedData.allEvents, ...newEvents].slice(-1000)
-        const allLogs = [...prevStats.accumulatedData.allLogs, ...newLogs].slice(-1000)
+        // Дедупликация - добавляем только новые данные
+        const existingAnomalyIds = new Set(prevStats.accumulatedData.allAnomalies.map(a => a.id))
+        const existingEventIds = new Set(prevStats.accumulatedData.allEvents.map(e => e.id || `${e.timestamp}-${e.source_ip}`))
+        const existingLogIds = new Set(prevStats.accumulatedData.allLogs.map(l => l.id || `${l.timestamp}-${l.source_ip}`))
+        
+        // Фильтруем только новые аномалии
+        const newUniqueAnomalies = newAnomalies.filter(a => !existingAnomalyIds.has(a.id))
+        const newUniqueEvents = newEvents.filter(e => !existingEventIds.has(e.id || `${e.timestamp}-${e.source_ip}`))
+        const newUniqueLogs = newLogs.filter(l => !existingLogIds.has(l.id || `${l.timestamp}-${l.source_ip}`))
+        
+        // Накопление данных - добавляем только уникальные новые данные
+        const allAnomalies = [...prevStats.accumulatedData.allAnomalies, ...newUniqueAnomalies].slice(-1000)
+        const allEvents = [...prevStats.accumulatedData.allEvents, ...newUniqueEvents].slice(-1000)
+        const allLogs = [...prevStats.accumulatedData.allLogs, ...newUniqueLogs].slice(-1000)
         
         // Подсчет метрик из накопленных данных
         const totalAnomalies = allAnomalies.length
