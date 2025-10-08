@@ -156,6 +156,16 @@ export const aiAssistantApi = {
     const response = await aiApi.get<AISummary>('/summary');
     return response.data;
   },
+
+  // Chat with AI
+  chat: async (message: string): Promise<{
+    response: string;
+    action_taken: string | null;
+    timestamp: string;
+  }> => {
+    const response = await aiApi.post('/chat', { message });
+    return response.data;
+  },
 };
 
 

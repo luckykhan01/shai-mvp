@@ -146,7 +146,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY=AIzaSyCwT1-0pREDEoyJcS6Ek80GNJ-kswqR--E
       - ML_DETECTOR_URL=http://ml-detector:8000
     depends_on:
       ml-detector:

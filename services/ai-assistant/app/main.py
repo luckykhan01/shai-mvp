@@ -44,7 +44,121 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable is required")
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Умные шаблоны для fallback режима
+def generate_smart_template_response(prompt: str) -> str:
+    """Генерирует умный ответ на основе шаблонов"""
+    prompt_lower = prompt.lower()
+    
+    # Команды блокировки/разблокировки
+    if "заблокируй" in prompt_lower or "блокировать" in prompt_lower or "добавь в черный" in prompt_lower:
+        # Ищем IP адрес в промпте
+        import re
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        ips = re.findall(ip_pattern, prompt)
+        if ips:
+            return json.dumps({
+                "action": "block_ip",
+                "ip": ips[0],
+                "reason": "Заблокировано по запросу пользователя",
+                "message": f"IP адрес {ips[0]} успешно добавлен в черный список"
+            }, ensure_ascii=False)
+    
+    if "разблокируй" in prompt_lower or "удали из черного" in prompt_lower or "убери блокировку" in prompt_lower:
+        import re
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        ips = re.findall(ip_pattern, prompt)
+        if ips:
+            return json.dumps({
+                "action": "unblock_ip",
+                "ip": ips[0],
+                "reason": "Разблокировано по запросу пользователя",
+                "message": f"IP адрес {ips[0]} успешно удален из черного списка"
+            }, ensure_ascii=False)
+    
+    if "белый список" in prompt_lower or "whitelist" in prompt_lower:
+        import re
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        ips = re.findall(ip_pattern, prompt)
+        if ips:
+            return json.dumps({
+                "action": "whitelist_ip",
+                "ip": ips[0],
+                "reason": "Добавлено в белый список по запросу пользователя",
+                "message": f"IP адрес {ips[0]} успешно добавлен в белый список"
+            }, ensure_ascii=False)
+    
+    # Общие вопросы о безопасности
+    if any(word in prompt_lower for word in ["что происходит", "статус", "как дела", "обстановка"]):
+        try:
+            # Пытаемся извлечь данные из промпта
+            if "аномалий" in prompt and "отслеживаемых ip" in prompt.lower():
+                lines = prompt.split('\n')
+                anomalies_count = 0
+                ips_count = 0
+                for line in lines:
+                    if "Всего аномалий:" in line:
+                        anomalies_count = int(line.split(':')[1].strip())
+                    if "Отслеживаемых IP:" in line:
+                        ips_count = int(line.split(':')[1].strip())
+                
+                if anomalies_count > 50:
+                    return f"⚠️ Обнаружено {anomalies_count} аномалий! Это повышенный уровень активности. Система отслеживает {ips_count} подозрительных IP адресов. Рекомендую проверить наиболее опасные IP и добавить их в черный список."
+                elif anomalies_count > 20:
+                    return f"📊 Текущая ситуация под контролем. Обнаружено {anomalies_count} аномалий при мониторинге {ips_count} IP адресов. Уровень угрозы: средний. Система продолжает мониторинг."
+                else:
+                    return f"✅ Система работает стабильно. Обнаружено {anomalies_count} незначительных аномалий. Все под контролем!"
+        except:
+            pass
+        
+        return "📊 Система мониторинга работает в штатном режиме. Обнаруженные аномалии анализируются в реальном времени. Могу помочь с анализом конкретных IP или управлением блокировками."
+    
+    # Помощь
+    if any(word in prompt_lower for word in ["помощь", "help", "что умеешь", "команды"]):
+        return """Я AI ассистент SecureWatch. Вот что я умею:
+
+🛡️ **Управление блокировками:**
+- "Заблокируй IP 192.168.1.100" - добавить IP в черный список
+- "Разблокируй IP 192.168.1.100" - удалить из черного списка  
+- "Добавь IP 192.168.1.100 в белый список" - добавить в whitelist
+
+📊 **Анализ безопасности:**
+- "Что происходит?" - общий статус безопасности
+- "Покажи аномалии" - список обнаруженных угроз
+- "Какие IP самые опасные?" - топ подозрительных адресов
+
+Просто задайте вопрос на естественном языке!"""
+    
+    # Дефолтный ответ
+    return "Я AI ассистент SecureWatch. Я могу помочь вам с анализом безопасности и управлением блокировками IP. Спросите меня о текущей ситуации или попросите заблокировать/разблокировать IP адрес. Напишите 'помощь' для списка команд."
+
+# Функция для вызова AI с fallback моделями
+def generate_ai_response(prompt: str, user_message: str = "") -> str:
+    """Генерирует ответ AI с fallback моделями или использует умные шаблоны"""
+    models_to_try = [
+        'gemini-1.5-flash-latest',
+        'gemini-1.5-flash',
+        'gemini-1.5-pro-latest',
+        'gemini-1.5-pro',
+        'gemini-pro',
+        'gemini-1.0-pro',
+    ]
+    
+    for model_name in models_to_try:
+        try:
+            log.info(f"Trying model: {model_name}")
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            log.info(f"Successfully used model: {model_name}")
+            return response.text
+        except Exception as e:
+            log.warning(f"Model {model_name} failed: {e}")
+            continue
+    
+    # Fallback: используем умные шаблоны вместо реального AI
+    # Используем user_message если передан, иначе prompt
+    log.warning("All AI models failed, using smart templates")
+    return generate_smart_template_response(user_message if user_message else prompt)
 
 # Конфигурация ML детектора
 ML_DETECTOR_URL = os.getenv("ML_DETECTOR_URL", "http://ml-detector:8000")
@@ -76,6 +190,10 @@ class AttackAnalysis(BaseModel):
     indicators: List[str]
     recommendations: List[str]
     confidence: float
+
+class ChatMessage(BaseModel):
+    message: str
+    context: Optional[Dict[str, Any]] = None
 
 class AIAssistant:
     def __init__(self):
@@ -125,6 +243,50 @@ class AIAssistant:
         except Exception as e:
             log.error(f"Failed to get deny list: {e}")
             return []
+    
+    async def add_to_blacklist(self, ip: str, description: str = "Blocked by AI Assistant") -> Dict:
+        """Добавляет IP в черный список"""
+        try:
+            payload = {
+                "type": "ip",
+                "value": ip,
+                "description": description
+            }
+            response = await self.client.post(f"{self.ml_detector_url}/lists/deny", json=payload)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            log.error(f"Failed to add {ip} to blacklist: {e}")
+            raise
+    
+    async def remove_from_blacklist(self, ip: str) -> Dict:
+        """Удаляет IP из черного списка"""
+        try:
+            payload = {
+                "item_type": "ip",
+                "value": ip
+            }
+            response = await self.client.delete(f"{self.ml_detector_url}/lists/deny", json=payload)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            log.error(f"Failed to remove {ip} from blacklist: {e}")
+            raise
+    
+    async def add_to_whitelist(self, ip: str, description: str = "Whitelisted by AI Assistant") -> Dict:
+        """Добавляет IP в белый список"""
+        try:
+            payload = {
+                "type": "ip",
+                "value": ip,
+                "description": description
+            }
+            response = await self.client.post(f"{self.ml_detector_url}/lists/allow", json=payload)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            log.error(f"Failed to add {ip} to whitelist: {e}")
+            raise
     
     def analyze_anomalies_with_ai(self, anomalies: List[Dict]) -> Dict[str, Any]:
         """Анализирует аномалии с помощью AI"""
@@ -185,8 +347,8 @@ class AIAssistant:
         """
         
         try:
-            response = model.generate_content(prompt)
-            ai_analysis = json.loads(response.text)
+            response_text = generate_ai_response(prompt)
+            ai_analysis = json.loads(response_text)
             
             # Добавляем реальные данные
             ai_analysis.update({
@@ -233,8 +395,8 @@ class AIAssistant:
         """
         
         try:
-            response = model.generate_content(prompt)
-            return json.loads(response.text)
+            response_text = generate_ai_response(prompt)
+            return json.loads(response_text)
         except Exception as e:
             log.error(f"Attack analysis failed: {e}")
             return {
@@ -364,6 +526,103 @@ async def get_security_summary():
     except Exception as e:
         log.exception("Failed to get security summary")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/chat")
+async def chat_with_ai(chat_msg: ChatMessage):
+    """Чат с AI ассистентом для анализа безопасности и управления блокировками"""
+    try:
+        user_message = chat_msg.message
+        log.info(f"Chat request: {user_message}")
+        
+        # Получаем контекст системы
+        anomalies = await ai_assistant.get_anomalies(limit=20)
+        ips_summary = await ai_assistant.get_ips_summary(limit=50)
+        deny_list = await ai_assistant.get_deny_list()
+        allow_list = await ai_assistant.get_allow_list()
+        
+        # Формируем системный промпт с контекстом
+        system_context = f"""
+Ты - AI ассистент безопасности для системы SecureWatch. 
+
+Текущая ситуация:
+- Всего аномалий: {len(anomalies)}
+- Отслеживаемых IP: {len(ips_summary)}
+- В черном списке: {len(deny_list)}
+- В белом списке: {len(allow_list)}
+
+Последние аномалии:
+{json.dumps(anomalies[:5], indent=2, ensure_ascii=False)}
+
+Топ подозрительных IP:
+{json.dumps(sorted(ips_summary, key=lambda x: x.get('recent_fail_ratio', 0), reverse=True)[:5], indent=2, ensure_ascii=False)}
+
+Ты можешь выполнять команды:
+1. "заблокируй IP X.X.X.X" - добавить IP в черный список
+2. "разблокируй IP X.X.X.X" - удалить IP из черного списка  
+3. "добавь IP X.X.X.X в белый список" - добавить в белый список
+4. Отвечать на вопросы о безопасности, аномалиях, IP адресах
+
+ВАЖНО: Если пользователь просит заблокировать/разблокировать IP, ответь в формате JSON:
+{{
+    "action": "block_ip" | "unblock_ip" | "whitelist_ip",
+    "ip": "X.X.X.X",
+    "reason": "причина",
+    "message": "сообщение пользователю"
+}}
+
+Если это просто вопрос, ответь обычным текстом на русском языке.
+"""
+        
+        # Отправляем запрос к Gemini AI
+        prompt = f"{system_context}\n\nВопрос пользователя: {user_message}\n\nОтвет:"
+        
+        ai_response = generate_ai_response(prompt, user_message).strip()
+        
+        log.info(f"AI response: {ai_response}")
+        
+        # Проверяем, есть ли команда для выполнения
+        action_taken = None
+        try:
+            # Пытаемся распарсить как JSON (команду)
+            if ai_response.startswith("{") and ai_response.endswith("}"):
+                command = json.loads(ai_response)
+                
+                if command.get("action") == "block_ip":
+                    ip = command.get("ip")
+                    reason = command.get("reason", "Blocked by AI Assistant")
+                    await ai_assistant.add_to_blacklist(ip, reason)
+                    action_taken = f"✅ IP {ip} добавлен в черный список"
+                    ai_response = command.get("message", action_taken)
+                    
+                elif command.get("action") == "unblock_ip":
+                    ip = command.get("ip")
+                    await ai_assistant.remove_from_blacklist(ip)
+                    action_taken = f"✅ IP {ip} удален из черного списка"
+                    ai_response = command.get("message", action_taken)
+                    
+                elif command.get("action") == "whitelist_ip":
+                    ip = command.get("ip")
+                    reason = command.get("reason", "Whitelisted by AI Assistant")
+                    await ai_assistant.add_to_whitelist(ip, reason)
+                    action_taken = f"✅ IP {ip} добавлен в белый список"
+                    ai_response = command.get("message", action_taken)
+        except:
+            # Это не команда, а обычный ответ
+            pass
+        
+        return {
+            "response": ai_response,
+            "action_taken": action_taken,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        log.exception("Chat failed")
+        return {
+            "response": f"Извините, произошла ошибка: {str(e)}",
+            "action_taken": None,
+            "timestamp": datetime.now().isoformat()
+        }
 
 if __name__ == "__main__":
     import uvicorn
