@@ -75,6 +75,9 @@ services:
       - RETRAIN_EVERY=2
       - CLEANUP_OLD_DATA=1
       - MAX_FEATURES_AGE_HOURS=24
+      # Пониженные пороги для автоблокировки
+      - HARD_FAIL_RATIO=0.6
+      - HARD_FAIL_MIN=10
     volumes:
       - ml-data:/app/data
     depends_on:
@@ -165,11 +168,15 @@ services:
       - "3000:3000"
     environment:
       - NODE_ENV=production
-      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8001
-      - NEXT_PUBLIC_AI_ASSISTANT_URL=http://localhost:8002
     depends_on:
       ml-detector:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks:
       - shai-network
     restart: unless-stopped

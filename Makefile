@@ -139,3 +139,18 @@ perf-test:
 			-d '[{"timestamp":"2024-01-01T00:00:00Z","event_id":"test-'$$i'","src_ip":"192.168.1.'$$i'","message":"Test event '$$i'","severity":"info"}]' > /dev/null; \
 	done
 	@echo "Sent 10 test events"
+
+# Frontend commands
+logs-frontend:
+	docker-compose logs -f frontend
+
+restart-frontend:
+	docker-compose restart frontend
+
+frontend-dev:
+	@echo "Starting frontend in development mode..."
+	cd frontend && npm install && npm run dev
+
+frontend-build:
+	@echo "Building frontend..."
+	cd frontend && npm install && npm run build

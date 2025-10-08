@@ -346,6 +346,34 @@ class IsoForestPerIP:
                 ) VALUES %s;
             """, rows, page_size=200)
 
+    def _auto_block_ips(self, conn, actions: List[Dict[str, Any]]):
+        """Автоматически добавляет IP в черный список при block_ip action"""
+        if not actions:
+            return
+        now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+        for act in actions:
+            if act.get("action") == "block_ip":
+                ip = act.get("ip")
+                reason = act.get("reason", "Automatically blocked by ML detector")
+                try:
+                    with conn.cursor() as cur:
+                        # Проверяем, не находится ли IP уже в черном списке
+                        cur.execute(f"""
+                            SELECT id FROM "{self._db_schema}".deny_list 
+                            WHERE item_type = 'ip' AND value = %s
+                        """, (ip,))
+                        existing = cur.fetchone()
+                        if not existing:
+                            # Добавляем в черный список
+                            cur.execute(f"""
+                                INSERT INTO "{self._db_schema}".deny_list 
+                                    (item_type, value, description, created_at)
+                                VALUES ('ip', %s, %s, %s)
+                            """, (ip, f"Auto-blocked: {reason}", now_iso))
+                            print(f"[AUTO-BLOCK] Added {ip} to blacklist: {reason}")
+                except Exception as e:
+                    print(f"[AUTO-BLOCK] Error adding {ip} to blacklist: {e}")
+
     def _vectorize_fit(self, feats: List[Dict[str, Any]]):
         self._vec = DictVectorizer(sparse=True)
         return self._vec.fit_transform(feats)
@@ -445,6 +473,8 @@ class IsoForestPerIP:
                 now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
                 self._db_insert_features(conn, now_iso, ip_feats)
                 self._db_insert_actions(conn, actions)
+                # Автоматически добавляем IP в черный список при block_ip
+                self._auto_block_ips(conn, actions)
 
         table_sorted = sorted(table, key=lambda r: (r["iso_score"] if r["iso_score"] is not None else float("inf")))
         return {
